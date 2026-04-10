@@ -13,6 +13,7 @@
 
 import db from '../db/database';
 import { detectWritingStyle } from '../../utils/constants';
+import { buildProseBuffer } from '../../utils/proseBuffer';
 
 function escapeRegex(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -167,6 +168,27 @@ export async function gatherContext({
         bridgeBuffer = prevMeta.last_prose_buffer || '';
         previousEmotionalState = prevMeta.emotional_state || null;
       }
+
+      if (!previousSummary && prevChapter.summary) {
+        previousSummary = prevChapter.summary;
+      }
+
+      if (!bridgeBuffer) {
+        try {
+          const prevScenes = await db.scenes.where('chapter_id').equals(prevChapter.id).sortBy('order_index');
+          const prevChapterText = prevScenes
+            .map((scene) => scene.draft_text || scene.final_text || '')
+            .join('\n')
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .trim();
+          if (prevChapterText) {
+            bridgeBuffer = buildProseBuffer(prevChapterText);
+          }
+        } catch (e) {
+          console.warn('[Context] Failed to build fallback bridge buffer (non-fatal):', e);
+        }
+      }
     }
   }
 
@@ -275,13 +297,19 @@ export async function gatherContext({
   }
 
   // --- Canon Facts ---
-  const canonFacts = allCanonFacts.filter(f => {
-    if (f.status !== 'active') return false;
-    if (f.fact_type === 'secret' && f.revealed_at_chapter && f.revealed_at_chapter <= chapterIndex + 1) {
-      return false;
-    }
-    return true;
-  });
+  const canonFacts = allCanonFacts
+    .filter(f => f.status === 'active')
+    .map((fact) => {
+      if (fact.fact_type !== 'secret' || !fact.revealed_at_chapter) {
+        return fact;
+      }
+
+      if (fact.revealed_at_chapter <= chapterIndex + 1) {
+        return { ...fact, fact_type: 'fact' };
+      }
+
+      return fact;
+    });
 
   // --- Plot Threads ---
   let activePlotThreads = [];

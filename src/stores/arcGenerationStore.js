@@ -19,6 +19,7 @@ import { gatherContext } from '../services/ai/contextEngine';
 import db from '../services/db/database';
 import useProjectStore from './projectStore';
 import { parseAIJsonValue, isPlainObject } from '../utils/aiJson';
+import { buildProseBuffer } from '../utils/proseBuffer';
 
 // Ensure router is injected (same pattern as aiStore.js)
 aiService.setRouter(modelRouter);
@@ -62,6 +63,37 @@ async function createArcRecord({ projectId, macroArcId, arcTitle, arcGoal, chapt
     });
 
     return arcId;
+}
+
+async function upsertChapterMetaForGeneratedChapter({
+    chapterId,
+    projectId,
+    summary = '',
+    rawText = '',
+}) {
+    if (!chapterId || !projectId) return;
+
+    const now = Date.now();
+    const proseBuffer = rawText ? buildProseBuffer(rawText) : '';
+    const existing = await db.chapterMeta.where('chapter_id').equals(chapterId).first();
+
+    if (existing) {
+        const updates = { summary, updated_at: now };
+        if (proseBuffer) updates.last_prose_buffer = proseBuffer;
+        await db.chapterMeta.update(existing.id, updates);
+        return;
+    }
+
+    await db.chapterMeta.add({
+        chapter_id: chapterId,
+        project_id: projectId,
+        summary,
+        last_prose_buffer: proseBuffer,
+        emotional_state: null,
+        tension_level: null,
+        created_at: now,
+        updated_at: now,
+    });
 }
 
 const useArcGenStore = create((set, get) => ({
@@ -252,6 +284,7 @@ const useArcGenStore = create((set, get) => ({
         if (!generatedOutline || !generatedOutline.chapters) return;
 
         const chapters = generatedOutline.chapters;
+        let generatedBridgeBuffer = '';
         set({
             draftStatus: 'drafting',
             draftProgress: { current: 0, total: chapters.length },
@@ -274,11 +307,14 @@ const useArcGenStore = create((set, get) => ({
             try {
                 const ctx = await gatherContext({
                     projectId, chapterId: null, chapterIndex: chapterIdx,
-                    sceneId: null, sceneText: '', genre,
+                    sceneId: null, sceneText: generatedBridgeBuffer, genre,
                 });
+                const previousGeneratedSummary = i > 0 ? (chapters[i - 1]?.summary || '') : '';
 
                 const messages = buildPrompt(TASK_TYPES.ARC_CHAPTER_DRAFT, {
                     ...ctx,
+                    previousSummary: previousGeneratedSummary || ctx.previousSummary,
+                    bridgeBuffer: generatedBridgeBuffer || ctx.bridgeBuffer,
                     chapterOutlineTitle: ch.title,
                     chapterOutlineSummary: ch.summary,
                     chapterOutlineEvents: ch.key_events || [],
@@ -295,6 +331,7 @@ const useArcGenStore = create((set, get) => ({
                         },
                         onComplete: (text) => {
                             const wordCount = text.split(/\s+/).filter(Boolean).length;
+                            generatedBridgeBuffer = buildProseBuffer(text);
                             set(state => ({
                                 draftProgress: { ...state.draftProgress, current: i + 1 },
                                 draftResults: state.draftResults.map((r, idx) =>
@@ -390,6 +427,12 @@ const useArcGenStore = create((set, get) => ({
                 draft_text: '',
                 final_text: '',
             });
+
+            await upsertChapterMetaForGeneratedChapter({
+                chapterId,
+                projectId,
+                summary: ch.summary || '',
+            });
         }
 
         await useProjectStore.getState().loadProject(projectId);
@@ -456,6 +499,13 @@ const useArcGenStore = create((set, get) => ({
                 draft_text: draft.content,
                 final_text: '',
             });
+
+            await upsertChapterMetaForGeneratedChapter({
+                chapterId,
+                projectId,
+                summary: generatedOutline.chapters[di]?.summary || '',
+                rawText: draft.content,
+            });
         }
 
         await useProjectStore.getState().loadProject(projectId);
@@ -489,6 +539,8 @@ const useArcGenStore = create((set, get) => ({
             ),
         }));
 
+        let regeneratedBridgeBuffer = '';
+
         for (let i = fromIndex; i < chapters.length; i++) {
             const { draftStatus } = get();
             if (draftStatus === 'idle') break;
@@ -510,8 +562,14 @@ const useArcGenStore = create((set, get) => ({
                 });
 
                 const flagNote = currentResults[i]?.flagNote || '';
+                const previousGeneratedSummary = i > 0 ? (chapters[i - 1]?.summary || '') : '';
+                const previousBridgeBuffer = regeneratedBridgeBuffer
+                    || buildProseBuffer(previousContent)
+                    || ctx.bridgeBuffer;
                 const messages = buildPrompt(TASK_TYPES.ARC_CHAPTER_DRAFT, {
                     ...ctx,
+                    previousSummary: previousGeneratedSummary || ctx.previousSummary,
+                    bridgeBuffer: previousBridgeBuffer,
                     chapterOutlineTitle: ch.title,
                     chapterOutlineSummary: ch.summary + (flagNote ? '. GHI CHU SUA DOI: ' + flagNote : ''),
                     chapterOutlineEvents: ch.key_events || [],
@@ -525,6 +583,7 @@ const useArcGenStore = create((set, get) => ({
                         onToken: () => { },
                         onComplete: (text) => {
                             const wordCount = text.split(/\s+/).filter(Boolean).length;
+                            regeneratedBridgeBuffer = buildProseBuffer(text);
                             set(state => ({
                                 draftProgress: { ...state.draftProgress, current: i + 1 },
                                 draftResults: state.draftResults.map((r, idx) =>
